@@ -3,26 +3,26 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 )
 
 type CacheEntry struct {
-	Path     string    `json:"path"`
-	MD5      string    `json:"md5"`
-	ModTime  time.Time `json:"mod_time"`
-	Size     int64     `json:"size"`
-	LastUsed time.Time `json:"last_used"`
+	Path    string
+	MD5     string
+	ModTime int64
+	Size    int64
 }
 
 type MD5Cache struct {
@@ -51,12 +51,31 @@ func (c *MD5Cache) loadFromFile(filename string) error {
 	}
 	defer file.Close()
 
-	var entries map[string]*CacheEntry
-	if err := json.NewDecoder(file).Decode(&entries); err != nil {
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
 		return err
 	}
 
-	c.entries = entries
+	for _, record := range records {
+		if len(record) != 4 {
+			continue
+		}
+		modTime, err := strconv.ParseInt(record[2], 10, 64)
+		if err != nil {
+			continue
+		}
+		size, err := strconv.ParseInt(record[3], 10, 64)
+		if err != nil {
+			continue
+		}
+		c.entries[record[0]] = &CacheEntry{
+			Path:    record[0],
+			MD5:     record[1],
+			ModTime: modTime,
+			Size:    size,
+		}
+	}
 	return nil
 }
 
@@ -72,10 +91,24 @@ func (c *MD5Cache) saveToFile(filename string) error {
 	}
 	defer file.Close()
 
-	return json.NewEncoder(file).Encode(c.entries)
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	for _, entry := range c.entries {
+		record := []string{
+			entry.Path,
+			entry.MD5,
+			strconv.FormatInt(entry.ModTime, 10),
+			strconv.FormatInt(entry.Size, 10),
+		}
+		if err := writer.Write(record); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (c *MD5Cache) get(path string, modTime time.Time, size int64) (string, bool) {
+func (c *MD5Cache) get(path string, modTime int64, size int64) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -91,35 +124,26 @@ func (c *MD5Cache) get(path string, modTime time.Time, size int64) (string, bool
 		return "", false
 	}
 
-	entry.LastUsed = time.Now()
 	c.hits++
 	return entry.MD5, true
 }
 
-func (c *MD5Cache) set(path string, md5Hash string, modTime time.Time, size int64) {
+func (c *MD5Cache) set(path string, md5Hash string, modTime int64, size int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if len(c.entries) >= 100000 {
-		oldestTime := time.Now()
-		var oldestPath string
-		for p, e := range c.entries {
-			if e.LastUsed.Before(oldestTime) {
-				oldestTime = e.LastUsed
-				oldestPath = p
-			}
-		}
-		if oldestPath != "" {
-			delete(c.entries, oldestPath)
+		for p := range c.entries {
+			delete(c.entries, p)
+			break
 		}
 	}
 
 	c.entries[path] = &CacheEntry{
-		Path:     path,
-		MD5:      md5Hash,
-		ModTime:  modTime,
-		Size:     size,
-		LastUsed: time.Now(),
+		Path:    path,
+		MD5:     md5Hash,
+		ModTime: modTime,
+		Size:    size,
 	}
 }
 
@@ -135,8 +159,13 @@ func calculateMD5(filename string, cache *MD5Cache) (string, error) {
 		return "", err
 	}
 
-	if cachedMD5, found := cache.get(filename, stat.ModTime(), stat.Size()); found {
-		return cachedMD5, nil
+	modTimeMs := stat.ModTime().Unix() * 1000
+	if cachedMD5, found := cache.get(filename, modTimeMs, stat.Size()); found {
+		// Decode from base64 and return as hex
+		md5Bytes, err := base64.StdEncoding.DecodeString(cachedMD5)
+		if err == nil {
+			return hex.EncodeToString(md5Bytes), nil
+		}
 	}
 
 	file, err := os.Open(filename)
@@ -150,10 +179,12 @@ func calculateMD5(filename string, cache *MD5Cache) (string, error) {
 		return "", err
 	}
 
-	md5Hash := hex.EncodeToString(hash.Sum(nil))
-	cache.set(filename, md5Hash, stat.ModTime(), stat.Size())
+	md5Bytes := hash.Sum(nil)
+	md5Hex := hex.EncodeToString(md5Bytes)
+	md5Base64 := base64.StdEncoding.EncodeToString(md5Bytes)
+	cache.set(filename, md5Base64, modTimeMs, stat.Size())
 
-	return md5Hash, nil
+	return md5Hex, nil
 }
 
 func convertBlobNameToLocalPath(blobName string) string {
@@ -186,7 +217,7 @@ func main() {
 	defer client.Close()
 
 	cache := NewMD5Cache()
-	cacheFile := "/var/kopia/.cache/kopia_md5_cache.json"
+	cacheFile := "/var/kopia/.cache/kopia_md5_cache.csv"
 	if err := cache.loadFromFile(cacheFile); err != nil {
 		fmt.Printf("Warning: Could not load cache: %v\n", err)
 	}
