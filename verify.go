@@ -188,23 +188,70 @@ func calculateMD5(filename string, cache *MD5Cache) (string, error) {
 }
 
 func convertBlobNameToLocalPath(blobName string) string {
-	if strings.HasPrefix(blobName, "p") || strings.HasPrefix(blobName, "q") || strings.HasPrefix(blobName, "s") {
-		return filepath.Join("/var/kopia/repository", blobName[:1], blobName)
+	// Handle special cases first
+	
+	// Log files: _log* -> /var/kopia/repository/_/log/{without_log_prefix}.f
+	if strings.HasPrefix(blobName, "_log_") {
+		actualName := strings.TrimPrefix(blobName, "_log") + ".f"
+		return filepath.Join("/var/kopia/repository", "_", "log", actualName)
 	}
 
+	// Kopia config files: kopia.* -> /var/kopia/repository/kopia.*.f
+	if strings.HasPrefix(blobName, "kopia.") {
+		return filepath.Join("/var/kopia/repository", blobName + ".f")
+	}
+
+	// xw files: xw* -> /var/kopia/repository/xw*.f
 	if strings.HasPrefix(blobName, "xw") {
-		return filepath.Join("/var/kopia/repository", blobName)
+		return filepath.Join("/var/kopia/repository", blobName + ".f")
 	}
 
-	if strings.HasPrefix(blobName, "xn0") {
-		return filepath.Join("/var/kopia/repository", blobName)
+	// Standard blob pattern for ALL other prefixes: {first_char}/{next_3_chars}/{rest}.f
+	if len(blobName) >= 4 {
+		firstChar := blobName[:1]          // "p", "q", "s", "x", etc.
+		next3Chars := blobName[1:4]        // "010", "n0_", etc.
+		rest := blobName[4:] + ".f"        // remaining part + .f suffix
+		return filepath.Join("/var/kopia/repository", firstChar, next3Chars, rest)
 	}
 
-	if strings.HasSuffix(blobName, ".f") && strings.HasPrefix(blobName, "_log") {
-		return filepath.Join("/var/kopia/repository", blobName)
-	}
-
+	// Fallback for unknown patterns
 	return filepath.Join("/var/kopia/repository", blobName)
+}
+
+func convertLocalPathToBlobName(localPath string) (string, error) {
+	// Remove the repository prefix
+	relPath := strings.TrimPrefix(localPath, "/var/kopia/repository/")
+	
+	// Handle special cases first
+	
+	// Log files: _/log/_20250903....f -> _log_20250903...
+	if strings.HasPrefix(relPath, "_/log/_") {
+		filename := strings.TrimPrefix(relPath, "_/log/")
+		if strings.HasSuffix(filename, ".f") {
+			return "_log" + strings.TrimSuffix(filename, ".f"), nil
+		}
+	}
+	
+	// Config files: kopia.repository.f -> kopia.repository
+	if strings.HasPrefix(relPath, "kopia.") && strings.HasSuffix(relPath, ".f") {
+		return strings.TrimSuffix(relPath, ".f"), nil
+	}
+	
+	// xw files: xw1757092255.f -> xw1757092255
+	if strings.HasSuffix(relPath, ".f") && strings.HasPrefix(filepath.Base(relPath), "xw") {
+		return strings.TrimSuffix(filepath.Base(relPath), ".f"), nil
+	}
+	
+	// Standard blob pattern: {prefix}/{3chars}/{rest}.f -> {prefix}{3chars}{rest}
+	parts := strings.Split(relPath, "/")
+	if len(parts) == 3 && strings.HasSuffix(parts[2], ".f") {
+		prefix := parts[0]                                    // "p", "q", "s", "x", etc.
+		subdir := parts[1]                                   // "010", "n0_", etc.
+		filename := strings.TrimSuffix(parts[2], ".f")       // rest without .f
+		return prefix + subdir + filename, nil
+	}
+	
+	return "", fmt.Errorf("unknown file pattern: %s", relPath)
 }
 
 func main() {
@@ -298,8 +345,88 @@ func main() {
 	fmt.Printf("  Cache: %d hits, %d misses\n", hits, misses)
 
 	if matched == len(gcsBlobs) && errors == 0 {
-		fmt.Printf("✓ Perfect verification: All blobs match!\n")
+		fmt.Printf("✓ GCS→Local verification: All GCS blobs found locally!\n")
 	} else {
-		fmt.Printf("✗ Verification failed: %d mismatches/errors\n", errors)
+		fmt.Printf("✗ GCS→Local verification failed: %d mismatches/errors\n", errors)
+		return
+	}
+
+	// Reverse verification: Local → GCS
+	fmt.Printf("\nStarting Local→GCS verification...\n")
+	
+	// Create a map of GCS blobs for fast lookup
+	gcsMap := make(map[string]bool)
+	for _, blob := range gcsBlobs {
+		gcsMap[blob.Name] = true
+	}
+	
+	var localFiles []string
+	var localErrors int
+	
+	// Walk the repository directory to find all local files
+	err = filepath.Walk("/var/kopia/repository", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		
+		if info.IsDir() {
+			return nil
+		}
+		
+		// Skip cache files, temporary files, and internal Kopia files
+		if strings.Contains(path, "/.cache/") || 
+		   strings.HasSuffix(path, ".tmp") ||
+		   strings.HasSuffix(path, ".shards") ||
+		   strings.Contains(path, "/.") {
+			return nil
+		}
+		
+		localFiles = append(localFiles, path)
+		return nil
+	})
+	
+	if err != nil {
+		fmt.Printf("Error walking repository: %v\n", err)
+		return
+	}
+	
+	fmt.Printf("Found %d local files\n", len(localFiles))
+	
+	var localMatched, localMissing int
+	
+	for i, localPath := range localFiles {
+		if i > 0 && i%100 == 0 {
+			fmt.Printf("Local progress: %d/%d files processed\n", i, len(localFiles))
+		}
+		
+		blobName, err := convertLocalPathToBlobName(localPath)
+		if err != nil {
+			fmt.Printf("Error converting path %s: %v\n", localPath, err)
+			localErrors++
+			continue
+		}
+		
+		if gcsMap[blobName] {
+			localMatched++
+		} else {
+			fmt.Printf("LOCAL FILE MISSING FROM GCS: %s → %s\n", localPath, blobName)
+			localMissing++
+		}
+	}
+	
+	fmt.Printf("\nLocal→GCS Verification Results:\n")
+	fmt.Printf("  Found in GCS: %d/%d files\n", localMatched, len(localFiles))
+	if localMissing > 0 {
+		fmt.Printf("  Missing from GCS: %d\n", localMissing)
+	}
+	if localErrors > 0 {
+		fmt.Printf("  Conversion errors: %d\n", localErrors)
+	}
+	
+	if localMatched == len(localFiles) && localMissing == 0 && localErrors == 0 {
+		fmt.Printf("✓ Local→GCS verification: All local files found in GCS!\n")
+		fmt.Printf("🎉 PERFECT BIDIRECTIONAL VERIFICATION: %d files match in both directions!\n", localMatched)
+	} else {
+		fmt.Printf("✗ Local→GCS verification failed: %d missing + %d errors\n", localMissing, localErrors)
 	}
 }
