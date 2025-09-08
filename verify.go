@@ -189,7 +189,7 @@ func calculateMD5(filename string, cache *MD5Cache) (string, error) {
 
 func convertBlobNameToLocalPath(blobName string) string {
 	// Handle special cases first
-	
+
 	// Log files: _log* -> /var/kopia/repository/_/log/{without_log_prefix}.f
 	if strings.HasPrefix(blobName, "_log_") {
 		actualName := strings.TrimPrefix(blobName, "_log") + ".f"
@@ -198,19 +198,19 @@ func convertBlobNameToLocalPath(blobName string) string {
 
 	// Kopia config files: kopia.* -> /var/kopia/repository/kopia.*.f
 	if strings.HasPrefix(blobName, "kopia.") {
-		return filepath.Join("/var/kopia/repository", blobName + ".f")
+		return filepath.Join("/var/kopia/repository", blobName+".f")
 	}
 
 	// xw files: xw* -> /var/kopia/repository/xw*.f
 	if strings.HasPrefix(blobName, "xw") {
-		return filepath.Join("/var/kopia/repository", blobName + ".f")
+		return filepath.Join("/var/kopia/repository", blobName+".f")
 	}
 
 	// Standard blob pattern for ALL other prefixes: {first_char}/{next_3_chars}/{rest}.f
 	if len(blobName) >= 4 {
-		firstChar := blobName[:1]          // "p", "q", "s", "x", etc.
-		next3Chars := blobName[1:4]        // "010", "n0_", etc.
-		rest := blobName[4:] + ".f"        // remaining part + .f suffix
+		firstChar := blobName[:1]   // "p", "q", "s", "x", etc.
+		next3Chars := blobName[1:4] // "010", "n0_", etc.
+		rest := blobName[4:] + ".f" // remaining part + .f suffix
 		return filepath.Join("/var/kopia/repository", firstChar, next3Chars, rest)
 	}
 
@@ -221,9 +221,9 @@ func convertBlobNameToLocalPath(blobName string) string {
 func convertLocalPathToBlobName(localPath string) (string, error) {
 	// Remove the repository prefix
 	relPath := strings.TrimPrefix(localPath, "/var/kopia/repository/")
-	
+
 	// Handle special cases first
-	
+
 	// Log files: _/log/_20250903....f -> _log_20250903...
 	if strings.HasPrefix(relPath, "_/log/_") {
 		filename := strings.TrimPrefix(relPath, "_/log/")
@@ -231,46 +231,30 @@ func convertLocalPathToBlobName(localPath string) (string, error) {
 			return "_log" + strings.TrimSuffix(filename, ".f"), nil
 		}
 	}
-	
+
 	// Config files: kopia.repository.f -> kopia.repository
 	if strings.HasPrefix(relPath, "kopia.") && strings.HasSuffix(relPath, ".f") {
 		return strings.TrimSuffix(relPath, ".f"), nil
 	}
-	
+
 	// xw files: xw1757092255.f -> xw1757092255
 	if strings.HasSuffix(relPath, ".f") && strings.HasPrefix(filepath.Base(relPath), "xw") {
 		return strings.TrimSuffix(filepath.Base(relPath), ".f"), nil
 	}
-	
+
 	// Standard blob pattern: {prefix}/{3chars}/{rest}.f -> {prefix}{3chars}{rest}
 	parts := strings.Split(relPath, "/")
 	if len(parts) == 3 && strings.HasSuffix(parts[2], ".f") {
-		prefix := parts[0]                                    // "p", "q", "s", "x", etc.
-		subdir := parts[1]                                   // "010", "n0_", etc.
-		filename := strings.TrimSuffix(parts[2], ".f")       // rest without .f
+		prefix := parts[0]                             // "p", "q", "s", "x", etc.
+		subdir := parts[1]                             // "010", "n0_", etc.
+		filename := strings.TrimSuffix(parts[2], ".f") // rest without .f
 		return prefix + subdir + filename, nil
 	}
-	
+
 	return "", fmt.Errorf("unknown file pattern: %s", relPath)
 }
 
-func main() {
-	ctx := context.Background()
-
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to create client: %v", err))
-	}
-	defer client.Close()
-
-	cache := NewMD5Cache()
-	cacheFile := "/var/kopia/.cache/kopia_md5_cache.csv"
-	if err := cache.loadFromFile(cacheFile); err != nil {
-		fmt.Printf("Warning: Could not load cache: %v\n", err)
-	}
-
-	bucket := client.Bucket("kopia-iowa")
-
+func verifyGCSRepository(ctx context.Context, client *storage.Client, bucket *storage.BucketHandle, cache *MD5Cache, cacheFile string, bucketName string) (bool, string) {
 	query := &storage.Query{
 		Projection: storage.ProjectionNoACL,
 	}
@@ -288,7 +272,8 @@ func main() {
 			break
 		}
 		if err != nil {
-			panic(fmt.Sprintf("Failed to iterate: %v", err))
+			fmt.Printf("Failed to iterate: %v\n", err)
+			return false, bucketName
 		}
 
 		gcsBlobs = append(gcsBlobs, struct {
@@ -348,64 +333,63 @@ func main() {
 		fmt.Printf("✓ GCS→Local verification: All GCS blobs found locally!\n")
 	} else {
 		fmt.Printf("✗ GCS→Local verification failed: %d mismatches/errors\n", errors)
-		return
 	}
 
 	// Reverse verification: Local → GCS
 	fmt.Printf("\nStarting Local→GCS verification...\n")
-	
+
 	// Create a map of GCS blobs for fast lookup
 	gcsMap := make(map[string]bool)
 	for _, blob := range gcsBlobs {
 		gcsMap[blob.Name] = true
 	}
-	
+
 	var localFiles []string
 	var localErrors int
-	
+
 	// Walk the repository directory to find all local files
-	err = filepath.Walk("/var/kopia/repository", func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk("/var/kopia/repository", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		
+
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		// Skip cache files, temporary files, and internal Kopia files
-		if strings.Contains(path, "/.cache/") || 
-		   strings.HasSuffix(path, ".tmp") ||
-		   strings.HasSuffix(path, ".shards") ||
-		   strings.Contains(path, "/.") {
+		if strings.Contains(path, "/.cache/") ||
+			strings.HasSuffix(path, ".tmp") ||
+			strings.HasSuffix(path, ".shards") ||
+			strings.Contains(path, "/.") {
 			return nil
 		}
-		
+
 		localFiles = append(localFiles, path)
 		return nil
 	})
-	
+
 	if err != nil {
 		fmt.Printf("Error walking repository: %v\n", err)
-		return
+		return false, bucketName
 	}
-	
+
 	fmt.Printf("Found %d local files\n", len(localFiles))
-	
+
 	var localMatched, localMissing int
-	
+
 	for i, localPath := range localFiles {
 		if i > 0 && i%100 == 0 {
 			fmt.Printf("Local progress: %d/%d files processed\n", i, len(localFiles))
 		}
-		
+
 		blobName, err := convertLocalPathToBlobName(localPath)
 		if err != nil {
 			fmt.Printf("Error converting path %s: %v\n", localPath, err)
 			localErrors++
 			continue
 		}
-		
+
 		if gcsMap[blobName] {
 			localMatched++
 		} else {
@@ -413,7 +397,7 @@ func main() {
 			localMissing++
 		}
 	}
-	
+
 	fmt.Printf("\nLocal→GCS Verification Results:\n")
 	fmt.Printf("  Found in GCS: %d/%d files\n", localMatched, len(localFiles))
 	if localMissing > 0 {
@@ -422,11 +406,76 @@ func main() {
 	if localErrors > 0 {
 		fmt.Printf("  Conversion errors: %d\n", localErrors)
 	}
-	
+
 	if localMatched == len(localFiles) && localMissing == 0 && localErrors == 0 {
 		fmt.Printf("✓ Local→GCS verification: All local files found in GCS!\n")
-		fmt.Printf("🎉 PERFECT BIDIRECTIONAL VERIFICATION: %d files match in both directions!\n", localMatched)
 	} else {
 		fmt.Printf("✗ Local→GCS verification failed: %d missing + %d errors\n", localMissing, localErrors)
 	}
+	success := (matched == len(gcsBlobs) && errors == 0) &&
+		(localMatched == len(localFiles) && localMissing == 0 && localErrors == 0)
+
+	return success, bucketName
+}
+
+func main() {
+	ctx := context.Background()
+
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create client: %v", err))
+	}
+	defer client.Close()
+
+	cache := NewMD5Cache()
+	cacheFile := "/var/kopia/.cache/kopia_md5_cache.csv"
+	if err := cache.loadFromFile(cacheFile); err != nil {
+		fmt.Printf("Warning: Could not load cache: %v\n", err)
+	}
+
+	bucketNames := []string{"kopia-iowa", "kopia-finland"}
+	buckets := []*storage.BucketHandle{
+		client.Bucket("kopia-iowa"),
+		client.Bucket("kopia-finland"),
+	}
+
+	// Track verification results for each bucket
+	bucketResults := make(map[string]bool)
+
+	for i, bucket := range buckets {
+		bucketName := bucketNames[i]
+		fmt.Println("\n" + strings.Repeat("=", 60))
+		fmt.Printf("Verifying bucket: %s\n", bucketName)
+		fmt.Println(strings.Repeat("=", 60))
+
+		verified, _ := verifyGCSRepository(ctx, client, bucket, cache, cacheFile, bucketName)
+		bucketResults[bucketName] = verified
+
+		if !verified {
+			fmt.Printf("Verification failed for bucket: %s\n", bucketName)
+		}
+	}
+
+	// Print summary of verification per bucket
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("VERIFICATION SUMMARY\n")
+	fmt.Println(strings.Repeat("=", 60))
+
+	allPassed := true
+	for bucketName, passed := range bucketResults {
+		status := "✓ PASSED"
+		if !passed {
+			status = "✗ FAILED"
+			allPassed = false
+		}
+		fmt.Printf("%-20s: %s\n", bucketName, status)
+	}
+
+	fmt.Println(strings.Repeat("-", 60))
+	if allPassed {
+		fmt.Printf("OVERALL RESULT: ✓ ALL BUCKETS VERIFIED SUCCESSFULLY\n")
+	} else {
+		fmt.Printf("OVERALL RESULT: ✗ SOME BUCKETS FAILED VERIFICATION\n")
+	}
+	fmt.Println(strings.Repeat("=", 60))
 }
