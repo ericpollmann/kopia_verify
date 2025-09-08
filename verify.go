@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -419,6 +420,10 @@ func verifyGCSRepository(ctx context.Context, client *storage.Client, bucket *st
 }
 
 func main() {
+	var bucketNamesFlag string
+	flag.StringVar(&bucketNamesFlag, "buckets", "kopia-iowa,kopia-finland", "Comma-separated list of bucket names")
+	flag.Parse()
+
 	ctx := context.Background()
 
 	client, err := storage.NewClient(ctx)
@@ -433,10 +438,10 @@ func main() {
 		fmt.Printf("Warning: Could not load cache: %v\n", err)
 	}
 
-	bucketNames := []string{"kopia-iowa", "kopia-finland"}
-	buckets := []*storage.BucketHandle{
-		client.Bucket("kopia-iowa"),
-		client.Bucket("kopia-finland"),
+	bucketNames := strings.Split(bucketNamesFlag, ",")
+	buckets := make([]*storage.BucketHandle, len(bucketNames))
+	for i, bucketName := range bucketNames {
+		buckets[i] = client.Bucket(strings.TrimSpace(bucketName))
 	}
 
 	// Track verification results for each bucket
